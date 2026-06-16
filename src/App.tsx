@@ -32,36 +32,23 @@ const SOURCES: SourceDef[] = [
 
 // ── Parser helpers ──────────────────────────────────────────────────────────
 function parseLineToProxy(raw: string): ProxyEntry | null {
-  // Accept tg://proxy?… or https://t.me/proxy?…
   const m = raw.match(
     /(?:tg:\/\/proxy|https:\/\/t\.me\/proxy)\?server=([^&]+)&port=(\d+)&secret=([^&\s]+)/i,
   );
   if (!m) return null;
-
   const server = decodeURIComponent(m[1]);
   const port = m[2];
   const secretRaw = m[3];
-
-  // Determine mode from first chars
   let mode: ProxyEntry["mode"] = "normal";
-  if (secretRaw.startsWith("ee")) {
-    mode = "fake-tls";
-  } else if (secretRaw.startsWith("dd")) {
-    mode = "secure";
-  }
-
-  // Build full tg:// link
+  if (secretRaw.startsWith("ee")) mode = "fake-tls";
+  else if (secretRaw.startsWith("dd")) mode = "secure";
   const fullUrl = `tg://proxy?server=${encodeURIComponent(server)}&port=${port}&secret=${secretRaw}`;
-
   return { server, port, secret: secretRaw, fullUrl, mode };
 }
 
-// ── Fetch & parse a source ──────────────────────────────────────────────────
-// Try direct fetch first, then fall back to public CORS proxies if blocked.
-// raw.githubusercontent.com normally sends CORS headers, but some networks/ISPs
-// strip them or block the host entirely.
+// ── Fetch with CORS fallbacks ───────────────────────────────────────────────
 const CORS_FALLBACKS = [
-  (u: string) => u, // direct
+  (u: string) => u,
   (u: string) => `https://corsproxy.io/?${encodeURIComponent(u)}`,
   (u: string) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
   (u: string) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
@@ -84,24 +71,27 @@ async function fetchWithFallbacks(url: string): Promise<string> {
 
 async function fetchSource(source: SourceDef): Promise<ProxyEntry[]> {
   const text = await fetchWithFallbacks(source.url);
-
   if (source.parser === "json") {
     try {
       const data = JSON.parse(text);
-      // shablin format: array of { host, port, secret }
       const proxies = Array.isArray(data) ? data : data.proxies || [];
       return proxies
-        .map((p: { host?: string; server?: string; port?: number | string; secret?: string }): ProxyEntry | null => {
-          const full = `tg://proxy?server=${encodeURIComponent(p.host || p.server || "")}&port=${p.port || 443}&secret=${p.secret || ""}`;
-          return parseLineToProxy(full);
-        })
+        .map(
+          (p: {
+            host?: string;
+            server?: string;
+            port?: number | string;
+            secret?: string;
+          }): ProxyEntry | null => {
+            const full = `tg://proxy?server=${encodeURIComponent(p.host || p.server || "")}&port=${p.port || 443}&secret=${p.secret || ""}`;
+            return parseLineToProxy(full);
+          },
+        )
         .filter((x: ProxyEntry | null): x is ProxyEntry => x !== null);
     } catch {
-      // fall through to line parsing
+      // fall through
     }
   }
-
-  // Line parser
   const lines = text.split(/\r?\n/);
   return lines
     .map((line) => line.trim())
@@ -128,23 +118,197 @@ function Toast({ msg, show }: { msg: string; show: boolean }) {
 
 function Spinner() {
   return (
-    <svg
-      className="h-5 w-5 animate-spin text-blue-500"
-      fill="none"
-      viewBox="0 0 24 24"
-    >
-      <circle
-        className="opacity-25"
-        cx="12" cy="12" r="10"
-        stroke="currentColor"
-        strokeWidth="4"
-      />
+    <svg className="h-5 w-5 animate-spin text-blue-500" fill="none" viewBox="0 0 24 24">
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
       <path
         className="opacity-75"
         fill="currentColor"
         d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
       />
     </svg>
+  );
+}
+
+// ── Bulk Open Modal ─────────────────────────────────────────────────────────
+function BulkOpenModal({
+  proxies,
+  onClose,
+}: {
+  proxies: ProxyEntry[];
+  onClose: () => void;
+}) {
+  const [current, setCurrent] = useState(0);
+  const [running, setRunning] = useState(false);
+  const [done, setDone] = useState(false);
+  const cancelRef = useRef(false);
+  const total = proxies.length;
+
+  const start = useCallback(async () => {
+    setRunning(true);
+    setDone(false);
+    cancelRef.current = false;
+
+    for (let i = 0; i < total; i++) {
+      if (cancelRef.current) break;
+      setCurrent(i + 1);
+
+      // Use an iframe to trigger tg:// links without popup-blocker issues.
+      // Each link is a protocol handler open — the browser hands it to Telegram
+      // without creating a new tab.
+      const iframe = document.createElement("iframe");
+      iframe.style.display = "none";
+      iframe.src = proxies[i].fullUrl;
+      document.body.appendChild(iframe);
+
+      // Small delay so Telegram can register each one before the next arrives
+      await new Promise((r) => setTimeout(r, 350));
+
+      // Clean up
+      document.body.removeChild(iframe);
+    }
+
+    setRunning(false);
+    setDone(true);
+  }, [proxies, total]);
+
+  const stop = useCallback(() => {
+    cancelRef.current = true;
+  }, []);
+
+  const pct = total > 0 ? Math.round((current / total) * 100) : 0;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
+      <div className="w-full max-w-md rounded-2xl border border-zinc-200 bg-white shadow-2xl">
+        {/* Header */}
+        <div className="flex items-center justify-between border-b border-zinc-100 px-6 py-4">
+          <h3 className="text-base font-bold text-zinc-900 flex items-center gap-2">
+            <svg className="h-5 w-5 text-blue-500" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.894 8.221l-1.97 9.28c-.145.658-.537.818-1.084.508l-3-2.21-1.446 1.394c-.16.16-.295.295-.605.295l.213-3.053 5.56-5.023c.24-.213-.054-.334-.373-.12l-6.87 4.326-2.96-.924c-.643-.2-.657-.643.136-.953l11.564-4.458c.538-.196 1.006.128.835.938z" />
+            </svg>
+            Bulk Import to Telegram
+          </h3>
+          <button
+            onClick={onClose}
+            className="flex h-8 w-8 items-center justify-center rounded-lg text-zinc-400 hover:bg-zinc-100 hover:text-zinc-600 transition-colors cursor-pointer"
+          >
+            <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+              <path d="M18 6L6 18M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+
+        {/* Body */}
+        <div className="px-6 py-5 space-y-4">
+          {/* Before start */}
+          {!running && !done && (
+            <>
+              <div className="rounded-xl bg-amber-50 border border-amber-200/60 px-4 py-3">
+                <p className="text-xs text-amber-800 leading-relaxed">
+                  <strong>How it works:</strong> Each proxy link will be sent to
+                  Telegram one by one. Your Telegram app will receive them as proxy
+                  add requests. Keep Telegram open during this process.
+                </p>
+              </div>
+              <div className="text-center">
+                <p className="text-sm text-zinc-600 mb-1">
+                  Ready to open <strong className="text-zinc-900">{total}</strong> proxies
+                </p>
+                <p className="text-[11px] text-zinc-400">
+                  ~{Math.ceil((total * 0.35))}s estimated time
+                </p>
+              </div>
+            </>
+          )}
+
+          {/* Running */}
+          {running && (
+            <>
+              <div className="space-y-2">
+                <div className="flex items-center justify-between text-xs text-zinc-500">
+                  <span>Opening proxies...</span>
+                  <span className="font-mono font-semibold text-zinc-800">
+                    {current} / {total}
+                  </span>
+                </div>
+                <div className="h-3 w-full rounded-full bg-zinc-100 overflow-hidden">
+                  <div
+                    className="h-full rounded-full bg-gradient-to-r from-blue-500 to-sky-400 transition-all duration-300 ease-out"
+                    style={{ width: `${pct}%` }}
+                  />
+                </div>
+              </div>
+              {current > 0 && current <= total && (
+                <p className="text-xs font-mono text-zinc-400 truncate">
+                  {proxies[current - 1]?.server}:{proxies[current - 1]?.port}
+                </p>
+              )}
+            </>
+          )}
+
+          {/* Done */}
+          {done && (
+            <div className="text-center py-2">
+              <div className="inline-flex h-12 w-12 items-center justify-center rounded-full bg-emerald-50 mb-3">
+                <svg className="h-6 w-6 text-emerald-500" fill="none" stroke="currentColor" strokeWidth={2.5} viewBox="0 0 24 24">
+                  <path d="M5 13l4 4L19 7" />
+                </svg>
+              </div>
+              <p className="text-sm font-semibold text-zinc-800">
+                {cancelRef.current
+                  ? `Stopped after ${current} of ${total} proxies`
+                  : `All ${total} proxies sent to Telegram!`}
+              </p>
+              <p className="text-xs text-zinc-400 mt-1">
+                Check your Telegram app to confirm the proxies were added.
+              </p>
+            </div>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="flex items-center justify-end gap-3 border-t border-zinc-100 px-6 py-4">
+          {!running && !done && (
+            <>
+              <button
+                onClick={onClose}
+                className="rounded-xl border border-zinc-200 bg-white px-4 py-2 text-xs font-semibold text-zinc-600 hover:bg-zinc-50 transition-colors cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={start}
+                className="rounded-xl bg-gradient-to-r from-blue-500 to-sky-500 px-5 py-2 text-xs font-semibold text-white shadow-md shadow-blue-200 hover:from-blue-600 hover:to-sky-600 transition-all cursor-pointer flex items-center gap-2"
+              >
+                <svg className="h-4 w-4" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.894 8.221l-1.97 9.28c-.145.658-.537.818-1.084.508l-3-2.21-1.446 1.394c-.16.16-.295.295-.605.295l.213-3.053 5.56-5.023c.24-.213-.054-.334-.373-.12l-6.87 4.326-2.96-.924c-.643-.2-.657-.643.136-.953l11.564-4.458c.538-.196 1.006.128.835.938z" />
+                </svg>
+                Open All {total} Proxies
+              </button>
+            </>
+          )}
+          {running && (
+            <button
+              onClick={stop}
+              className="rounded-xl bg-red-500 px-5 py-2 text-xs font-semibold text-white shadow-md shadow-red-200 hover:bg-red-600 transition-all cursor-pointer flex items-center gap-2"
+            >
+              <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth={2.5} viewBox="0 0 24 24">
+                <rect x="6" y="6" width="12" height="12" rx="1" />
+              </svg>
+              Stop
+            </button>
+          )}
+          {done && (
+            <button
+              onClick={onClose}
+              className="rounded-xl bg-gradient-to-r from-blue-500 to-sky-500 px-5 py-2 text-xs font-semibold text-white shadow-md shadow-blue-200 hover:from-blue-600 hover:to-sky-600 transition-all cursor-pointer"
+            >
+              Done
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -155,7 +319,7 @@ function ProxyRow({
 }: {
   proxy: ProxyEntry;
   index: number;
-  onCopy: (text: string) => void;
+  onCopy: (url: string) => void;
 }) {
   const modeBadge = {
     normal: "bg-zinc-100 text-zinc-600",
@@ -177,20 +341,15 @@ function ProxyRow({
 
   return (
     <div className="group flex items-center gap-3 rounded-xl border border-zinc-200/70 bg-white/80 px-4 py-3 hover:border-blue-200/60 hover:shadow-sm transition-all duration-200">
-      {/* Index */}
       <span className="w-7 text-xs font-mono text-zinc-400 tabular-nums text-right shrink-0">
         {index}
       </span>
-
-      {/* Server info */}
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
           <span className="text-sm font-medium text-zinc-800 truncate">
             {proxy.server}
           </span>
-          <span className="text-xs font-mono text-zinc-400 shrink-0">
-            :{proxy.port}
-          </span>
+          <span className="text-xs font-mono text-zinc-400 shrink-0">:{proxy.port}</span>
           <span
             className={cn(
               "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold shrink-0",
@@ -202,15 +361,10 @@ function ProxyRow({
           </span>
         </div>
         <p className="text-[11px] font-mono text-zinc-400 truncate mt-0.5">
-          {proxy.secret.length > 40
-            ? proxy.secret.slice(0, 40) + "..."
-            : proxy.secret}
+          {proxy.secret.length > 40 ? proxy.secret.slice(0, 40) + "..." : proxy.secret}
         </p>
       </div>
-
-      {/* Actions */}
       <div className="flex items-center gap-1.5 shrink-0">
-        {/* Open in Telegram */}
         <a
           href={proxy.fullUrl}
           target="_blank"
@@ -222,20 +376,12 @@ function ProxyRow({
             <path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.894 8.221l-1.97 9.28c-.145.658-.537.818-1.084.508l-3-2.21-1.446 1.394c-.16.16-.295.295-.605.295l.213-3.053 5.56-5.023c.24-.213-.054-.334-.373-.12l-6.87 4.326-2.96-.924c-.643-.2-.657-.643.136-.953l11.564-4.458c.538-.196 1.006.128.835.938z" />
           </svg>
         </a>
-
-        {/* Copy */}
         <button
           onClick={() => onCopy(proxy.fullUrl)}
           className="flex h-8 w-8 items-center justify-center rounded-lg bg-zinc-100 text-zinc-400 opacity-0 group-hover:opacity-100 hover:bg-blue-100 hover:text-blue-600 transition-all duration-200 cursor-pointer"
           title="Copy link"
         >
-          <svg
-            className="h-3.5 w-3.5"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth={2}
-            viewBox="0 0 24 24"
-          >
+          <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
             <rect x="9" y="9" width="13" height="13" rx="2" />
             <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" />
           </svg>
@@ -256,6 +402,7 @@ export default function App() {
   const [toastMsg, setToastMsg] = useState("");
   const [toastVisible, setToastVisible] = useState(false);
   const toastTimer = useRef<number>(0);
+  const [bulkOpen, setBulkOpen] = useState(false);
 
   const showToast = useCallback((msg: string) => {
     setToastMsg(msg);
@@ -289,7 +436,6 @@ export default function App() {
     [showToast],
   );
 
-  // Auto-fetch on first render
   useEffect(() => {
     fetchProxies(SOURCES[0]);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -307,7 +453,6 @@ export default function App() {
     [showToast],
   );
 
-  // Filter
   const filtered = proxies.filter((p) => {
     if (filterMode !== "all" && p.mode !== filterMode) return false;
     if (search.trim()) {
@@ -321,6 +466,16 @@ export default function App() {
     return true;
   });
 
+  const handleCopyAll = useCallback(async () => {
+    const allLinks = filtered.map((p) => p.fullUrl).join("\n");
+    try {
+      await navigator.clipboard.writeText(allLinks);
+      showToast(`Copied ${filtered.length} links to clipboard!`);
+    } catch {
+      showToast("Failed to copy");
+    }
+  }, [filtered, showToast]);
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-zinc-50 via-white to-blue-50/30">
       {/* ── Header ─────────────────────────────────────────────── */}
@@ -329,11 +484,7 @@ export default function App() {
         <div className="relative mx-auto max-w-5xl px-6 py-8 sm:py-10">
           <div className="flex items-center gap-4 mb-2">
             <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-blue-500 to-sky-400 shadow-lg shadow-blue-200/50">
-              <svg
-                className="h-6 w-6 text-white"
-                viewBox="0 0 24 24"
-                fill="currentColor"
-              >
+              <svg className="h-6 w-6 text-white" viewBox="0 0 24 24" fill="currentColor">
                 <path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.894 8.221l-1.97 9.28c-.145.658-.537.818-1.084.508l-3-2.21-1.446 1.394c-.16.16-.295.295-.605.295l.213-3.053 5.56-5.023c.24-.213-.054-.334-.373-.12l-6.87 4.326-2.96-.924c-.643-.2-.657-.643.136-.953l11.564-4.458c.538-.196 1.006.128.835.938z" />
               </svg>
             </div>
@@ -342,7 +493,7 @@ export default function App() {
                 MTProto Proxy List
               </h1>
               <p className="text-sm text-zinc-500 mt-0.5">
-                Live working Telegram proxy links from open-source sources
+                Live working Telegram proxy links — fetch &amp; bulk import
               </p>
             </div>
           </div>
@@ -350,7 +501,7 @@ export default function App() {
       </header>
 
       <main className="mx-auto max-w-5xl px-6 py-8 space-y-6">
-        {/* ── Source selector + fetch ──────────────────────────── */}
+        {/* ── Source selector ─────────────────────────────────────── */}
         <section>
           <div className="flex flex-wrap items-center gap-3 mb-5">
             <span className="text-xs font-semibold text-zinc-500 uppercase tracking-wide">
@@ -377,7 +528,9 @@ export default function App() {
               </button>
             ))}
             <button
-              onClick={() => fetchProxies(SOURCES.find((s) => s.name === activeSource) || SOURCES[0])}
+              onClick={() =>
+                fetchProxies(SOURCES.find((s) => s.name === activeSource) || SOURCES[0])
+              }
               disabled={loading}
               className="ml-auto rounded-xl border border-zinc-200 bg-white px-4 py-2 text-xs font-semibold text-zinc-600 hover:bg-zinc-50 hover:border-zinc-300 transition-all cursor-pointer flex items-center gap-1.5 disabled:opacity-50"
             >
@@ -395,14 +548,13 @@ export default function App() {
             </button>
           </div>
 
-          {/* Error */}
           {error && (
             <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 mb-4">
               {error}
             </div>
           )}
 
-          {/* Stats + Filter bar */}
+          {/* Stats + Filter + Bulk actions bar */}
           <div className="flex flex-wrap items-center gap-3 mb-4">
             <div className="flex items-center gap-2 text-sm text-zinc-500">
               {loading ? (
@@ -411,16 +563,16 @@ export default function App() {
                 </span>
               ) : (
                 <span>
-                  <strong className="text-zinc-800">{proxies.length}</strong>{" "}
-                  total proxies
+                  <strong className="text-zinc-800">{proxies.length}</strong> total
                   {filtered.length !== proxies.length && (
-                    <>, <strong className="text-zinc-800">{filtered.length}</strong> shown</>
+                    <>
+                      , <strong className="text-zinc-800">{filtered.length}</strong> shown
+                    </>
                   )}
                 </span>
               )}
             </div>
 
-            {/* Search */}
             <input
               type="text"
               value={search}
@@ -429,7 +581,6 @@ export default function App() {
               className="flex-1 min-w-[180px] rounded-xl border border-zinc-200 bg-white px-4 py-2 text-xs text-zinc-900 placeholder:text-zinc-400 focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-400 transition-all"
             />
 
-            {/* Mode filter */}
             <select
               value={filterMode}
               onChange={(e) => setFilterMode(e.target.value as typeof filterMode)}
@@ -442,6 +593,43 @@ export default function App() {
             </select>
           </div>
 
+          {/* ── Bulk action buttons ───────────────────────────────── */}
+          {filtered.length > 0 && !loading && (
+            <div className="flex flex-wrap items-center gap-3 mb-4 rounded-xl border border-blue-200/60 bg-blue-50/40 px-4 py-3">
+              <span className="text-xs font-semibold text-blue-700 flex items-center gap-1.5">
+                <svg className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                  <path d="M13 10V3L4 14h7v7l9-11h-7z" />
+                </svg>
+                Bulk Actions
+              </span>
+
+              <button
+                onClick={() => setBulkOpen(true)}
+                className="rounded-lg bg-gradient-to-r from-blue-500 to-sky-500 px-4 py-1.5 text-xs font-semibold text-white shadow-sm hover:from-blue-600 hover:to-sky-600 transition-all cursor-pointer flex items-center gap-1.5"
+              >
+                <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.894 8.221l-1.97 9.28c-.145.658-.537.818-1.084.508l-3-2.21-1.446 1.394c-.16.16-.295.295-.605.295l.213-3.053 5.56-5.023c.24-.213-.054-.334-.373-.12l-6.87 4.326-2.96-.924c-.643-.2-.657-.643.136-.953l11.564-4.458c.538-.196 1.006.128.835.938z" />
+                </svg>
+                Open All {filtered.length} in Telegram
+              </button>
+
+              <button
+                onClick={handleCopyAll}
+                className="rounded-lg border border-zinc-200 bg-white px-4 py-1.5 text-xs font-semibold text-zinc-600 hover:bg-zinc-50 hover:border-zinc-300 transition-all cursor-pointer flex items-center gap-1.5"
+              >
+                <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                  <rect x="9" y="9" width="13" height="13" rx="2" />
+                  <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" />
+                </svg>
+                Copy All Links
+              </button>
+
+              <span className="text-[11px] text-zinc-400 ml-auto hidden sm:block">
+                Opens each proxy in Telegram one-by-one for import
+              </span>
+            </div>
+          )}
+
           {/* Proxy list */}
           {loading && proxies.length === 0 ? (
             <div className="flex items-center justify-center py-20 text-zinc-400">
@@ -450,7 +638,13 @@ export default function App() {
             </div>
           ) : filtered.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-20 text-zinc-400">
-              <svg className="h-10 w-10 mb-3" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
+              <svg
+                className="h-10 w-10 mb-3"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth={1.5}
+                viewBox="0 0 24 24"
+              >
                 <circle cx="11" cy="11" r="8" />
                 <path d="M21 21l-4.35-4.35" />
               </svg>
@@ -479,22 +673,27 @@ export default function App() {
             </svg>
             How to Use
           </h2>
-          <div className="grid gap-4 sm:grid-cols-3">
+          <div className="grid gap-4 sm:grid-cols-4">
             {[
               {
                 step: "1",
                 title: "Pick a proxy",
-                desc: "Browse the list above and click the Telegram icon next to any proxy you want to try.",
+                desc: "Click the Telegram icon next to any proxy to add it individually.",
               },
               {
                 step: "2",
-                title: "Open in Telegram",
-                desc: "Your browser will prompt to open Telegram. Accept it — Telegram automatically configures the proxy.",
+                title: "Or bulk import",
+                desc: "Click \"Open All in Telegram\" to send every proxy to Telegram at once.",
               },
               {
                 step: "3",
-                title: "Or add manually",
-                desc: "Copy the link, go to Telegram Settings → Data and Storage → Proxy → Add Proxy, then paste.",
+                title: "Accept in Telegram",
+                desc: "Your Telegram app will show each proxy as an add-proxy prompt. Accept them.",
+              },
+              {
+                step: "4",
+                title: "Pick the fastest",
+                desc: "Go to Settings → Data & Storage → Proxy. Telegram shows ping for each — pick the lowest.",
               },
             ].map((item) => (
               <div
@@ -504,12 +703,8 @@ export default function App() {
                 <span className="inline-flex h-7 w-7 items-center justify-center rounded-full bg-blue-100 text-xs font-bold text-blue-600 mb-3">
                   {item.step}
                 </span>
-                <h3 className="text-sm font-bold text-zinc-700 mb-1.5">
-                  {item.title}
-                </h3>
-                <p className="text-xs text-zinc-500 leading-relaxed">
-                  {item.desc}
-                </p>
+                <h3 className="text-sm font-bold text-zinc-700 mb-1.5">{item.title}</h3>
+                <p className="text-xs text-zinc-500 leading-relaxed">{item.desc}</p>
               </div>
             ))}
           </div>
@@ -560,19 +755,15 @@ export default function App() {
                 >
                   {item.label}
                 </span>
-                <p className="text-[11px] text-zinc-500 leading-relaxed">
-                  {item.desc}
-                </p>
+                <p className="text-[11px] text-zinc-500 leading-relaxed">{item.desc}</p>
               </div>
             ))}
           </div>
         </section>
 
-        {/* ── Sources / credits ─────────────────────────────────── */}
+        {/* ── Sources ───────────────────────────────────────────── */}
         <section className="border-t border-zinc-200/60 pt-8">
-          <h2 className="text-lg font-semibold text-zinc-800 mb-4">
-            Open Source Data Sources
-          </h2>
+          <h2 className="text-lg font-semibold text-zinc-800 mb-4">Open Source Data Sources</h2>
           <div className="grid gap-3 sm:grid-cols-2">
             {[
               {
@@ -647,6 +838,11 @@ export default function App() {
           </p>
         </footer>
       </main>
+
+      {/* ── Bulk Open Modal ──────────────────────────────────────── */}
+      {bulkOpen && (
+        <BulkOpenModal proxies={filtered} onClose={() => setBulkOpen(false)} />
+      )}
 
       <Toast msg={toastMsg} show={toastVisible} />
     </div>
